@@ -160,15 +160,83 @@ kubectl exec -it <gravitino-pod> -n gravitino -- env | grep AWS_ROLE_ARN
 # Should show the IAM role ARN
 ```
 
+## Deploy on EKS (Full End-to-End Proof)
+
+The `k8s/` directory contains ready-to-deploy manifests for testing on an actual EKS
+cluster with IRSA. This is the only way to fully prove credential vending works.
+
+### Structure
+
+```
+k8s/
+├── 00-namespace.yaml           # gravitino-repro namespace
+├── 01-serviceaccount.yaml      # ServiceAccount with IRSA annotation
+├── broken-s3-token/            # ❌ Original manifests (reproduces the error)
+│   ├── configmap.yaml          #    GRAVITINO_CREDENTIAL_PROVIDERS=s3-token
+│   ├── secret.yaml             #    Static AWS key placeholders
+│   └── deployment.yaml         #    Injects GRAVITINO_S3_ACCESS_KEY from Secret
+├── fixed-aws-irsa/             # ✅ Corrected manifests (the fix)
+│   ├── configmap.yaml          #    GRAVITINO_CREDENTIAL_PROVIDERS=aws-irsa
+│   └── deployment.yaml         #    No static keys, uses IRSA
+└── verify-eks.sh               # Verification script
+```
+
+### Prerequisites
+
+1. EKS cluster with OIDC provider enabled
+2. IAM role with S3 access + trust policy for the OIDC provider
+3. `kubectl` configured for the cluster
+
+### Steps
+
+```bash
+# 1. Edit placeholders in the manifests
+#    - 01-serviceaccount.yaml: set your IAM role ARN
+#    - configmap.yaml: set your S3 bucket, region, Hive Metastore URI, role ARN
+
+# 2. Deploy the namespace + service account
+kubectl apply -f k8s/00-namespace.yaml
+kubectl apply -f k8s/01-serviceaccount.yaml
+
+# 3a. To REPRODUCE the error (broken):
+kubectl apply -f k8s/broken-s3-token/
+
+# 3b. To TEST the fix (correct):
+kubectl apply -f k8s/fixed-aws-irsa/
+
+# 4. Verify
+bash k8s/verify-eks.sh
+```
+
+### What to Expect
+
+**With `broken-s3-token/`**: The pod starts, but loading a table with
+`X-Iceberg-Access-Delegation: vended-credentials` returns:
+```
+The AWS Access Key Id you provided does not exist in our records
+```
+
+**With `fixed-aws-irsa/`**: The pod starts, and credential vending returns temporary
+S3 credentials scoped to the table path. The verify script should show:
+```
+✅ SUCCESS (HTTP 200) — credential vending works!
+```
+
 ## File Structure
 
 ```
 gravitino-repro/
-├── README.md              # This file
-├── docker-compose.yml     # MinIO + Hive Metastore
-├── repro-test.sh          # Automated 5-scenario reproduction
-└── conf/
-    └── hive-site.xml      # Hive Metastore → MinIO S3A config
+├── README.md                   # This file
+├── docker-compose.yml          # Local: MinIO + Hive Metastore
+├── repro-test.sh               # Local: Automated 5-scenario Docker test
+├── conf/
+│   └── hive-site.xml           # Hive Metastore → MinIO S3A config
+└── k8s/                        # EKS: Ready-to-deploy K8s manifests
+    ├── 00-namespace.yaml
+    ├── 01-serviceaccount.yaml
+    ├── broken-s3-token/        # ❌ Reproduces the error
+    ├── fixed-aws-irsa/         # ✅ The fix
+    └── verify-eks.sh           # Verification script
 ```
 
 ## Verified Against

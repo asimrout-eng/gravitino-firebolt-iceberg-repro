@@ -1,0 +1,19 @@
+# BROKEN: Uses s3-token which requires static IAM keys.
+# This does NOT work with IRSA.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gravitino-config
+  namespace: gravitino-repro
+data:
+  GRAVITINO_URI: "thrift://hive-metastore:9083"
+  GRAVITINO_WAREHOUSE: "s3://YOUR_BUCKET/iceberg"
+  GRAVITINO_CATALOG_BACKEND: "hive"
+  GRAVITINO_IO_IMPL: "org.apache.iceberg.aws.s3.S3FileIO"
+  GRAVITINO_S3_REGION: "us-east-1"
+  GRAVITINO_S3_ENDPOINT: "https://s3.us-east-1.amazonaws.com"
+  GRAVITINO_S3_PATH_STYLE_ACCESS: "false"
+
+  # ⚠️  WRONG PROVIDER — s3-token requires static keys, not IRSA
+  GRAVITINO_CREDENTIAL_PROVIDERS: "s3-token"
+  GRAVITINO_S3_ROLE_ARN: "arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>"

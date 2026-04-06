@@ -1,0 +1,18 @@
+# FIXED: Uses aws-irsa — designed for EKS/IRSA, no static keys needed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gravitino-config
+  namespace: gravitino-repro
+data:
+  GRAVITINO_URI: "thrift://hive-metastore:9083"
+  GRAVITINO_WAREHOUSE: "s3://YOUR_BUCKET/iceberg"
+  GRAVITINO_CATALOG_BACKEND: "hive"
+  GRAVITINO_IO_IMPL: "org.apache.iceberg.aws.s3.S3FileIO"
+  GRAVITINO_S3_REGION: "us-east-1"
+  GRAVITINO_S3_ENDPOINT: "https://s3.us-east-1.amazonaws.com"
+  GRAVITINO_S3_PATH_STYLE_ACCESS: "false"
+
+  # ✅ CORRECT PROVIDER — aws-irsa uses the IRSA web identity token
+  GRAVITINO_CREDENTIAL_PROVIDERS: "aws-irsa"
+  GRAVITINO_S3_ROLE_ARN: "arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>"
