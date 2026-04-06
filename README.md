@@ -1,18 +1,81 @@
-# Gravitino 1.2.0 — S3 Credential Provider Reproduction
+# Firebolt + Gravitino Iceberg REST — S3 Credential Reproduction & E2E Test
 
-Reproduction of the `The AWS Access Key Id you provided does not exist in our records`
-error when using Apache Gravitino 1.2.0 as an Iceberg REST catalog with AWS S3 and IRSA
-(IAM Roles for Service Accounts) in EKS.
+End-to-end reproduction and fix for connecting **Firebolt** to **Apache Gravitino 1.2.0**
+(Iceberg REST catalog) with **AWS S3** using **IRSA** (IAM Roles for Service Accounts) in EKS.
 
-## Root Cause (TL;DR)
+Includes:
+- Automated local Docker test (5 scenarios, no AWS needed)
+- Ready-to-deploy EKS manifests (broken + fixed, side by side)
+- One-command EKS setup with Firebolt Cloud integration
+- Full root cause analysis with official documentation references
 
-The customer configured `credential-providers=s3-token`, which **requires static IAM keys**.
-The correct provider for EKS/IRSA is `credential-providers=aws-irsa`, available since
-Gravitino 1.0.0 — [official docs](https://gravitino.apache.org/docs/1.2.0/security/credential-vending#s3-irsa-credential).
+## Background
 
-Additionally, the Helm chart's `rewrite_config.py` writes `s3-access-key-id = ` (blank)
-into the config when `GRAVITINO_S3_ACCESS_KEY` is set to an empty string, overriding the
-AWS default credential chain.
+When Firebolt queries an Iceberg table via Gravitino, the flow is:
+
+```
+Firebolt Engine
+    │
+    │ 1. OAuth: client_id + client_secret → JWT token
+    │ 2. GET /iceberg/v1/hive/namespaces/{ns}/tables/{table}
+    │    (Bearer token + X-Iceberg-Access-Delegation: vended-credentials)
+    ▼
+Gravitino Iceberg REST (port 9001)
+    │
+    │ 3. getTable() via Thrift
+    ▼
+Hive Metastore (port 9083)
+    │
+    │ 4. Returns metadata location: s3://bucket/path/metadata.json
+    ▼
+Gravitino reads Iceberg metadata from S3
+    │  (via IRSA — no static keys)
+    │
+    │ 5. Returns to Firebolt:
+    │    - Table schema + file list
+    │    - Vended temporary S3 credentials
+    ▼
+Firebolt Engine reads Parquet files directly from S3
+    (using vended credentials — data never passes through Gravitino)
+```
+
+## The Problem
+
+Firebolt returns:
+
+```
+The AWS Access Key Id you provided does not exist in our records
+```
+
+## Root Cause
+
+Two issues in the K8s manifests provided to the customer:
+
+**1. Wrong credential provider**
+
+The ConfigMap sets `GRAVITINO_CREDENTIAL_PROVIDERS: "s3-token"`. The `s3-token` provider
+requires **static IAM access keys** (`AKIA...`) in the config. It does not work with IRSA.
+
+The correct provider for EKS/IRSA is **`aws-irsa`**, available since Gravitino 1.0.0.
+
+**2. Blank keys from `rewrite_config.py`**
+
+The Deployment injects `GRAVITINO_S3_ACCESS_KEY` from a Kubernetes Secret. When the Secret
+has placeholder/empty values, the `rewrite_config.py` script inside the Gravitino Docker
+image writes `s3-access-key-id = ` (blank) into the config, overriding the AWS default
+credential chain.
+
+```python
+# Inside /root/gravitino-iceberg-rest-server/bin/rewrite_config.py
+env_map = {
+    "GRAVITINO_S3_ACCESS_KEY": "s3-access-key-id",
+    "GRAVITINO_S3_SECRET_KEY": "s3-secret-access-key",
+}
+
+for k, v in env_map.items():
+    if k in os.environ:          # checks key EXISTS, not if value is non-empty
+        update_config(config_map, v, os.environ[k])
+```
 
 ## Credential Providers in Gravitino 1.2.0
 
@@ -22,82 +85,20 @@ AWS default credential chain.
 | S3 Token | `s3-token` | STS AssumeRole with static keys | **Yes** — `s3-access-key-id` + `s3-secret-access-key` | 0.8.0 |
 | S3 Secret Key | `s3-secret-key` | Passthrough static keys | **Yes** | 0.8.0 |
 
-Source: https://gravitino.apache.org/docs/1.2.0/security/credential-vending
-
-## What This Repo Tests
-
-Five scenarios that isolate and reproduce the problem:
-
-| # | Scenario | Credential Provider | S3 Keys | Expected Result |
-|---|---|---|---|---|
-| 1 | Explicit static keys | none | `GRAVITINO_S3_ACCESS_KEY=minioadmin` | **PASS** — metadata read works |
-| 2 | Blank keys (customer bug) | none | `GRAVITINO_S3_ACCESS_KEY=""` | **FAIL** — blank key written to config |
-| 3 | No keys, default chain | none | env `AWS_ACCESS_KEY_ID` only | **PASS** — falls back to SDK chain |
-| 4 | s3-token + temp keys | `s3-token` | `GRAVITINO_S3_ACCESS_KEY=ASIA...` | **FAIL** — no session token support |
-| 5 | aws-irsa (correct fix) | `aws-irsa` | None | **FAIL locally** (no EKS) / **PASS in EKS** |
-
-## Prerequisites
-
-- Docker + Docker Compose
-- ~2 GB free disk (MinIO, Hive Metastore, Gravitino images)
-- Port 19000, 19001, 19083, 19201 free
-
-## Quick Start
-
-```bash
-# Clone and enter the directory
-cd gravitino-repro
-
-# Start base services (MinIO + Hive Metastore)
-docker compose up -d
-# Wait ~45 seconds for Hive Metastore to initialize
-
-# Run the full reproduction
-./repro-test.sh
-
-# Cleanup
-docker compose down -v
-```
-
-## Understanding the `rewrite_config.py` Problem
-
-Inside the `apache/gravitino-iceberg-rest:1.2.0` Docker image, a Python script at
-`/root/gravitino-iceberg-rest-server/bin/rewrite_config.py` runs at container startup.
-It maps environment variables to config properties:
-
-```python
-env_map = {
-    "GRAVITINO_S3_ACCESS_KEY": "s3-access-key-id",
-    "GRAVITINO_S3_SECRET_KEY": "s3-secret-access-key",
-    # ... other mappings
-}
-
-for k, v in env_map.items():
-    if k in os.environ:          # checks key EXISTS, not if value is non-empty
-        update_config(config_map, v, os.environ[k])
-```
-
-When the Helm chart renders `GRAVITINO_S3_ACCESS_KEY: ""` (empty string), the env var
-**exists** in the container's environment. The script writes `s3-access-key-id = ` (blank)
-into the config. This blank value overrides the AWS SDK default credential chain, causing
-S3 requests to fail.
-
-## The `s3-token` vs `aws-irsa` Difference
+Source: [Gravitino 1.2.0 Credential Vending Documentation](https://gravitino.apache.org/docs/1.2.0/security/credential-vending)
 
 ### Why `s3-token` fails with IRSA
 
-The `s3-token` provider (class: `S3TokenGenerator`) internally creates an STS client using
-the **explicit** `s3-access-key-id` and `s3-secret-access-key` from the config. There is
-no config property for `s3-session-token`, so temporary credentials (IRSA, STS sessions)
-cannot be used — the STS `AssumeRole` call fails without the session token.
+`S3TokenGenerator` creates an STS client using the explicit `s3-access-key-id` and
+`s3-secret-access-key` from the config. There is no config property for `s3-session-token`,
+so temporary credentials (IRSA, STS sessions) cannot be used.
 
 ### Why `aws-irsa` works with IRSA
 
-The `aws-irsa` provider (class: `AwsIrsaCredentialGenerator`) reads the
-`AWS_WEB_IDENTITY_TOKEN_FILE` environment variable injected by EKS IRSA and uses
-`StsClient` with web identity token authentication. No static keys needed.
+`AwsIrsaCredentialGenerator` reads the `AWS_WEB_IDENTITY_TOKEN_FILE` environment variable
+injected by EKS IRSA and uses `StsClient` with web identity token authentication.
 
-Verified error when running `aws-irsa` outside EKS:
+Verified error when running outside EKS:
 
 ```
 Caused by: java.lang.IllegalStateException:
@@ -105,131 +106,114 @@ Caused by: java.lang.IllegalStateException:
   Ensure IRSA is properly configured in your EKS cluster.
 ```
 
-This confirms `aws-irsa` explicitly uses the IRSA mechanism and will work in EKS.
+This confirms `aws-irsa` is the IRSA-specific code path and will work in EKS.
 
-## Fix for the Customer
+## The Fix
 
-### Option A: Use `aws-irsa` credential provider (recommended)
+**Two changes in the K8s manifests:**
 
-Set in the Gravitino Helm values or environment:
+1. In the ConfigMap, change `GRAVITINO_CREDENTIAL_PROVIDERS` from `s3-token` to `aws-irsa`
+2. In the Deployment, remove the `GRAVITINO_S3_ACCESS_KEY` and `GRAVITINO_S3_SECRET_KEY`
+   environment variables entirely
 
-```yaml
-# Helm values.yaml
-gravitino:
-  credentialProviders: "aws-irsa"
-  s3:
-    roleArn: "arn:aws:iam::<ACCOUNT>:role/gravitino-firebolt-role"
-    region: "ap-south-1"
-```
+**IRSA prerequisites** (if not already set up):
 
-Or as environment variables on the pod:
-
-```bash
-GRAVITINO_CREDENTIAL_PROVIDERS=aws-irsa
-GRAVITINO_S3_ROLE_ARN=arn:aws:iam::<ACCOUNT>:role/gravitino-firebolt-role
-GRAVITINO_S3_REGION=ap-south-1
-```
-
-**Important**: Do NOT set `GRAVITINO_S3_ACCESS_KEY` or `GRAVITINO_S3_SECRET_KEY` at all.
-Remove them entirely from the Helm template / ConfigMap / environment.
-
-### Option B: Remove blank env vars (partial fix)
-
-If only metadata reads are needed (no credential vending to Firebolt):
-
-1. Remove `GRAVITINO_S3_ACCESS_KEY` and `GRAVITINO_S3_SECRET_KEY` entirely from the
-   Helm chart templates and pod environment
-2. Gravitino's S3FileIO will use the AWS SDK default credential chain (which picks up
-   IRSA tokens in EKS)
-
-This fixes metadata reads but does NOT enable credential vending to Firebolt.
-
-### IRSA Prerequisites (EKS)
-
-1. EKS cluster with OIDC provider configured
-2. IAM role with S3 access and trust policy for the OIDC provider
+1. EKS cluster with OIDC provider
+2. IAM role with S3 access + trust policy for the OIDC provider
 3. Kubernetes ServiceAccount annotated with the IAM role ARN
-4. Pod using that ServiceAccount
+4. Gravitino Deployment referencing that ServiceAccount
 
-```bash
-# Verify IRSA is working inside the Gravitino pod
-kubectl exec -it <gravitino-pod> -n gravitino -- env | grep AWS_WEB_IDENTITY
-# Should show: AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/secrets/eks.amazonaws.com/serviceaccount/token
+---
 
-kubectl exec -it <gravitino-pod> -n gravitino -- env | grep AWS_ROLE_ARN
-# Should show the IAM role ARN
-```
+## Test 1: Local Docker (No AWS Needed)
 
-## Deploy on EKS (Full End-to-End Proof)
-
-The `k8s/` directory contains ready-to-deploy manifests for testing on an actual EKS
-cluster with IRSA. This is the only way to fully prove credential vending works.
-
-### Structure
-
-```
-k8s/
-├── 00-namespace.yaml           # gravitino-repro namespace
-├── 01-serviceaccount.yaml      # ServiceAccount with IRSA annotation
-├── broken-s3-token/            # ❌ Original manifests (reproduces the error)
-│   ├── configmap.yaml          #    GRAVITINO_CREDENTIAL_PROVIDERS=s3-token
-│   ├── secret.yaml             #    Static AWS key placeholders
-│   └── deployment.yaml         #    Injects GRAVITINO_S3_ACCESS_KEY from Secret
-├── fixed-aws-irsa/             # ✅ Corrected manifests (the fix)
-│   ├── configmap.yaml          #    GRAVITINO_CREDENTIAL_PROVIDERS=aws-irsa
-│   └── deployment.yaml         #    No static keys, uses IRSA
-└── verify-eks.sh               # Verification script
-```
+Automated 5-scenario test using MinIO as S3-compatible storage.
 
 ### Prerequisites
 
-1. EKS cluster with OIDC provider enabled
-2. IAM role with S3 access + trust policy for the OIDC provider
-3. `kubectl` configured for the cluster
+- Docker + Docker Compose
+- ~2 GB free disk
+- Ports 19000, 19001, 19083, 19201 free
 
-### Steps
+### Run
 
 ```bash
-# 1. Edit placeholders in the manifests
-#    - 01-serviceaccount.yaml: set your IAM role ARN
-#    - configmap.yaml: set your S3 bucket, region, Hive Metastore URI, role ARN
+git clone https://github.com/asimrout-eng/gravitino-firebolt-iceberg-repro.git
+cd gravitino-firebolt-iceberg-repro
 
-# 2. Deploy the namespace + service account
+docker compose up -d
+# Wait ~45 seconds for Hive Metastore to initialize
+
+./repro-test.sh
+
+docker compose down -v
+```
+
+### Scenarios
+
+| # | Scenario | Credential Provider | S3 Keys | Expected |
+|---|---|---|---|---|
+| 1 | Explicit static keys (baseline) | none | `GRAVITINO_S3_ACCESS_KEY=minioadmin` | **PASS** |
+| 2 | Blank keys (customer's bug) | none | `GRAVITINO_S3_ACCESS_KEY=""` | **FAIL** |
+| 3 | No keys, default chain (workaround) | none | env `AWS_ACCESS_KEY_ID` only | **PASS** |
+| 4 | s3-token provider (wrong for IRSA) | `s3-token` | none | **FAIL** |
+| 5 | aws-irsa provider (correct for IRSA) | `aws-irsa` | none | **EXPECTED** (needs EKS) |
+
+---
+
+## Test 2: EKS — Reproduce Error vs Fix
+
+Deploy both the broken and fixed manifests on EKS to prove the issue and the fix
+with real IRSA credentials.
+
+### Prerequisites
+
+- EKS cluster with OIDC provider enabled
+- IAM role with S3 access + IRSA trust policy
+- `kubectl` configured for the cluster
+
+### Deploy
+
+```bash
+# Edit placeholders in the manifests:
+#   01-serviceaccount.yaml → your IAM role ARN
+#   configmap.yaml → your bucket, region, Hive Metastore URI
+
 kubectl apply -f k8s/00-namespace.yaml
 kubectl apply -f k8s/01-serviceaccount.yaml
 
-# 3a. To REPRODUCE the error (broken):
+# To REPRODUCE the error:
 kubectl apply -f k8s/broken-s3-token/
 
-# 3b. To TEST the fix (correct):
+# To TEST the fix:
 kubectl apply -f k8s/fixed-aws-irsa/
 
-# 4. Verify
+# Verify
 bash k8s/verify-eks.sh
 ```
 
-### What to Expect
+### Expected Results
 
-**With `broken-s3-token/`**: The pod starts, but loading a table with
-`X-Iceberg-Access-Delegation: vended-credentials` returns:
+**With `broken-s3-token/`**: Loading a table with credential vending returns:
 ```
 The AWS Access Key Id you provided does not exist in our records
 ```
 
-**With `fixed-aws-irsa/`**: The pod starts, and credential vending returns temporary
-S3 credentials scoped to the table path. The verify script should show:
+**With `fixed-aws-irsa/`**: Credential vending succeeds:
 ```
-✅ SUCCESS (HTTP 200) — credential vending works!
+SUCCESS (HTTP 200) — credential vending works!
 ```
 
-## End-to-End Test with Firebolt Cloud
+---
 
-This is the full production-equivalent proof: Firebolt Cloud → Gravitino (EKS, IRSA) → S3.
+## Test 3: Firebolt Cloud + EKS (Full End-to-End)
+
+The production-equivalent proof: **Firebolt Cloud → Gravitino (EKS, IRSA) → S3**.
 
 ### One-Command Setup
 
 ```bash
-# Edit variables at the top of the script first (cluster name, region, bucket, etc.)
+# Edit variables at the top of the script (cluster name, region, bucket, etc.)
 bash k8s/setup-eks.sh
 ```
 
@@ -237,31 +221,26 @@ This script:
 1. Creates an EKS cluster (or uses existing)
 2. Sets up OIDC provider for IRSA
 3. Creates IAM role with S3 access + IRSA trust policy
-4. Deploys Gravitino with `aws-irsa` credential provider
-5. Deploys OAuth server for authentication
-6. Creates a public NLB for Firebolt Cloud to reach Gravitino
-7. Prints the `CREATE LOCATION` and `READ_ICEBERG` SQL to run in Firebolt
+4. Creates Kubernetes ServiceAccount with IRSA annotation
+5. Deploys Gravitino with `aws-irsa` credential provider
+6. Deploys OAuth server for JWT authentication
+7. Creates a public NLB for Firebolt Cloud connectivity
+8. Prints the exact SQL to run in Firebolt
 
 ### Manual Steps
 
-If you prefer step-by-step:
-
 ```bash
-# 1. Deploy namespace + IRSA service account
 kubectl apply -f k8s/00-namespace.yaml
 kubectl apply -f k8s/01-serviceaccount.yaml
-
-# 2. Deploy Gravitino (aws-irsa) + OAuth server + public NLB
 kubectl apply -f k8s/fixed-aws-irsa/
 kubectl apply -f k8s/02-oauth-server.yaml
 kubectl apply -f k8s/03-public-nlb.yaml
 
-# 3. Get the NLB DNS
+# Get the NLB DNS name
 kubectl get svc gravitino-public -n gravitino-repro
-# Note the EXTERNAL-IP
-
-# 4. Run in Firebolt Cloud
 ```
+
+### Firebolt Cloud SQL
 
 ```sql
 CREATE LOCATION gravitino_eks_test
@@ -294,35 +273,134 @@ SELECT * FROM READ_ICEBERG(
 ### Cleanup
 
 ```bash
-# Delete everything
 eksctl delete cluster --name gravitino-repro --region us-east-1
 aws iam delete-role-policy --role-name gravitino-repro-s3-role --policy-name s3-access
 aws iam delete-role --role-name gravitino-repro-s3-role
 ```
 
+---
+
+## IRSA Setup Reference
+
+If IRSA is not yet configured on your EKS cluster:
+
+### 1. Enable OIDC provider
+
+```bash
+eksctl utils associate-iam-oidc-provider \
+  --cluster <CLUSTER_NAME> --region <REGION> --approve
+```
+
+### 2. Get the OIDC ID
+
+```bash
+aws eks describe-cluster --name <CLUSTER_NAME> --region <REGION> \
+  --query "cluster.identity.oidc.issuer" --output text
+# Returns: https://oidc.eks.<REGION>.amazonaws.com/id/<OIDC_ID>
+```
+
+### 3. Create IAM role with IRSA trust policy
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::<ACCOUNT>:oidc-provider/oidc.eks.<REGION>.amazonaws.com/id/<OIDC_ID>"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "oidc.eks.<REGION>.amazonaws.com/id/<OIDC_ID>:sub": "system:serviceaccount:<NAMESPACE>:<SA_NAME>",
+        "oidc.eks.<REGION>.amazonaws.com/id/<OIDC_ID>:aud": "sts.amazonaws.com"
+      }
+    }
+  }]
+}
+```
+
+### 4. Attach S3 policy to the role
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<BUCKET>/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::<BUCKET>"
+    }
+  ]
+}
+```
+
+### 5. Create annotated ServiceAccount
+
+```bash
+kubectl create serviceaccount <SA_NAME> -n <NAMESPACE>
+kubectl annotate serviceaccount <SA_NAME> -n <NAMESPACE> \
+  eks.amazonaws.com/role-arn=arn:aws:iam::<ACCOUNT>:role/<ROLE_NAME>
+```
+
+### 6. Verify IRSA inside the pod
+
+```bash
+kubectl exec <POD> -n <NAMESPACE> -- env | grep AWS_WEB_IDENTITY_TOKEN_FILE
+# Should return: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+
+kubectl exec <POD> -n <NAMESPACE> -- env | grep AWS_ROLE_ARN
+# Should return the IAM role ARN
+```
+
+---
+
 ## File Structure
 
 ```
-gravitino-repro/
+gravitino-firebolt-iceberg-repro/
+│
 ├── README.md                   # This file
 ├── docker-compose.yml          # Local: MinIO + Hive Metastore
 ├── repro-test.sh               # Local: Automated 5-scenario Docker test
 ├── conf/
 │   └── hive-site.xml           # Hive Metastore → MinIO S3A config
-└── k8s/                        # EKS: Ready-to-deploy K8s manifests
+│
+└── k8s/                        # EKS deployment manifests
     ├── 00-namespace.yaml       # Namespace
     ├── 01-serviceaccount.yaml  # IRSA-annotated ServiceAccount
     ├── 02-oauth-server.yaml    # OAuth token server (JWT)
-    ├── 03-public-nlb.yaml      # Public NLB for Firebolt Cloud access
-    ├── setup-eks.sh            # One-command EKS + IRSA + Firebolt setup
+    ├── 03-public-nlb.yaml      # Public NLB for Firebolt Cloud
+    ├── setup-eks.sh            # One-command full EKS setup
     ├── verify-eks.sh           # Verification script
-    ├── broken-s3-token/        # ❌ Reproduces the error
-    └── fixed-aws-irsa/         # ✅ The fix
+    │
+    ├── broken-s3-token/        # Reproduces the customer error
+    │   ├── configmap.yaml      #   GRAVITINO_CREDENTIAL_PROVIDERS=s3-token
+    │   ├── secret.yaml         #   Static AWS key placeholders
+    │   └── deployment.yaml     #   Injects GRAVITINO_S3_ACCESS_KEY
+    │
+    └── fixed-aws-irsa/         # The fix
+        ├── configmap.yaml      #   GRAVITINO_CREDENTIAL_PROVIDERS=aws-irsa
+        └── deployment.yaml     #   No static keys, uses IRSA
 ```
 
 ## Verified Against
 
-- Gravitino `apache/gravitino-iceberg-rest:1.2.0` (latest release as of March 2026)
+- Gravitino `apache/gravitino-iceberg-rest:1.2.0` (latest as of March 2026)
 - Hive Metastore `apache/hive:4.0.0`
-- MinIO latest (S3-compatible storage for local testing)
+- MinIO latest (S3-compatible, local testing)
 - macOS (Docker Desktop) and Linux
+- [Gravitino 1.2.0 credential vending docs](https://gravitino.apache.org/docs/1.2.0/security/credential-vending)
+
+## References
+
+- [Gravitino Credential Vending — Official Docs](https://gravitino.apache.org/docs/1.2.0/security/credential-vending)
+- [S3 IRSA Credential Provider](https://gravitino.apache.org/docs/1.2.0/security/credential-vending#s3-irsa-credential)
+- [S3 Token Credential Provider](https://gravitino.apache.org/docs/1.2.0/security/credential-vending#s3-token-credential)
+- [AWS IRSA Documentation](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)
+- [AwsIrsaCredential JavaDoc (1.2.0)](https://gravitino.apache.org/docs/1.2.0/api/java/org/apache/gravitino/credential/AwsIrsaCredential.html)
