@@ -1,0 +1,68 @@
+# OAuth2 token server for Gravitino.
+# Issues JWT tokens via client_credentials grant.
+# Firebolt uses this to authenticate before calling Gravitino REST API.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth-server
+  namespace: gravitino-repro
+  labels:
+    app: oauth-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth-server
+  template:
+    metadata:
+      labels:
+        app: oauth-server
+    spec:
+      containers:
+        - name: oauth-server
+          image: apache/gravitino-iceberg-rest:1.2.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              cd /root/gravitino-iceberg-rest-server
+              cat > conf/oauth-server.properties <<PROPS
+              oauth.server.port=8080
+              oauth.server.signAlgorithmType=HS256
+              oauth.server.signKey=${OAUTH_SIGN_KEY_B64}
+              oauth.server.tokenPath=${OAUTH_TOKEN_PATH}
+              oauth.server.audience=${OAUTH_AUDIENCE}
+              oauth.clients.firebolt.secret=${OAUTH_CLIENT_SECRET}
+              PROPS
+              exec java -cp "libs/*" org.apache.gravitino.iceberg.integration.test.util.OAuthMockServer 8080
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OAUTH_SIGN_KEY_B64
+              value: "Z3Jhdml0aW5vLXJlcHJvLXNpZ24ta2V5LTIwMjY="
+            - name: OAUTH_TOKEN_PATH
+              value: "/oauth/tokens"
+            - name: OAUTH_AUDIENCE
+              value: "gravitino"
+            - name: OAUTH_CLIENT_SECRET
+              value: "repro-secret-change-me"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth-server
+  namespace: gravitino-repro
+spec:
+  selector:
+    app: oauth-server
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

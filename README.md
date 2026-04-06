@@ -222,6 +222,84 @@ S3 credentials scoped to the table path. The verify script should show:
 ✅ SUCCESS (HTTP 200) — credential vending works!
 ```
 
+## End-to-End Test with Firebolt Cloud
+
+This is the full production-equivalent proof: Firebolt Cloud → Gravitino (EKS, IRSA) → S3.
+
+### One-Command Setup
+
+```bash
+# Edit variables at the top of the script first (cluster name, region, bucket, etc.)
+bash k8s/setup-eks.sh
+```
+
+This script:
+1. Creates an EKS cluster (or uses existing)
+2. Sets up OIDC provider for IRSA
+3. Creates IAM role with S3 access + IRSA trust policy
+4. Deploys Gravitino with `aws-irsa` credential provider
+5. Deploys OAuth server for authentication
+6. Creates a public NLB for Firebolt Cloud to reach Gravitino
+7. Prints the `CREATE LOCATION` and `READ_ICEBERG` SQL to run in Firebolt
+
+### Manual Steps
+
+If you prefer step-by-step:
+
+```bash
+# 1. Deploy namespace + IRSA service account
+kubectl apply -f k8s/00-namespace.yaml
+kubectl apply -f k8s/01-serviceaccount.yaml
+
+# 2. Deploy Gravitino (aws-irsa) + OAuth server + public NLB
+kubectl apply -f k8s/fixed-aws-irsa/
+kubectl apply -f k8s/02-oauth-server.yaml
+kubectl apply -f k8s/03-public-nlb.yaml
+
+# 3. Get the NLB DNS
+kubectl get svc gravitino-public -n gravitino-repro
+# Note the EXTERNAL-IP
+
+# 4. Run in Firebolt Cloud
+```
+
+```sql
+CREATE LOCATION gravitino_eks_test
+WITH
+  SOURCE = ICEBERG
+  CATALOG = REST
+  CATALOG_OPTIONS = (
+    URL = 'http://<NLB_DNS>:9001/iceberg/'
+    WAREHOUSE = 'hive'
+    OAUTH_SERVER_URI = 'http://<NLB_DNS>:8080'
+    OAUTH_TOKEN_PATH = '/oauth/tokens'
+    CREDENTIAL = 'firebolt:repro-secret-change-me'
+  );
+
+SELECT * FROM READ_ICEBERG(
+  LOCATION => 'gravitino_eks_test',
+  NAMESPACE => '<namespace>',
+  TABLE => '<table>'
+) LIMIT 10;
+```
+
+### What This Proves
+
+- Firebolt Cloud authenticates with Gravitino via OAuth (JWT)
+- Gravitino reads Iceberg metadata from S3 using IRSA (no static keys)
+- Gravitino vends temporary S3 credentials to Firebolt via `aws-irsa` provider
+- Firebolt reads Parquet files directly from S3 using vended credentials
+- **Zero static AWS keys in the entire flow**
+
+### Cleanup
+
+```bash
+# Delete everything
+eksctl delete cluster --name gravitino-repro --region us-east-1
+aws iam delete-role-policy --role-name gravitino-repro-s3-role --policy-name s3-access
+aws iam delete-role --role-name gravitino-repro-s3-role
+```
+
 ## File Structure
 
 ```
@@ -232,11 +310,14 @@ gravitino-repro/
 ├── conf/
 │   └── hive-site.xml           # Hive Metastore → MinIO S3A config
 └── k8s/                        # EKS: Ready-to-deploy K8s manifests
-    ├── 00-namespace.yaml
-    ├── 01-serviceaccount.yaml
+    ├── 00-namespace.yaml       # Namespace
+    ├── 01-serviceaccount.yaml  # IRSA-annotated ServiceAccount
+    ├── 02-oauth-server.yaml    # OAuth token server (JWT)
+    ├── 03-public-nlb.yaml      # Public NLB for Firebolt Cloud access
+    ├── setup-eks.sh            # One-command EKS + IRSA + Firebolt setup
+    ├── verify-eks.sh           # Verification script
     ├── broken-s3-token/        # ❌ Reproduces the error
-    ├── fixed-aws-irsa/         # ✅ The fix
-    └── verify-eks.sh           # Verification script
+    └── fixed-aws-irsa/         # ✅ The fix
 ```
 
 ## Verified Against
