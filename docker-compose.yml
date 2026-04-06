@@ -1,0 +1,54 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: grav-minio
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: grav-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://grav-minio:9000 minioadmin minioadmin &&
+      mc mb local/iceberg-warehouse --ignore-existing &&
+      echo 'Bucket iceberg-warehouse created successfully'
+      "
+
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: grav-hive
+    environment:
+      SERVICE_NAME: metastore
+      HIVE_AUX_JARS_PATH: "/opt/hadoop/share/hadoop/tools/lib/hadoop-aws-3.3.6.jar,/opt/hadoop/share/hadoop/tools/lib/aws-java-sdk-bundle-1.12.367.jar"
+      HADOOP_CLASSPATH: "/opt/hadoop/share/hadoop/tools/lib/hadoop-aws-3.3.6.jar:/opt/hadoop/share/hadoop/tools/lib/aws-java-sdk-bundle-1.12.367.jar"
+    ports:
+      - "19083:9083"
+    volumes:
+      - ./conf/hive-site.xml:/opt/hive/conf/hive-site.xml
+      - hive_data:/opt/hive/data
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9083"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  hive_data:
