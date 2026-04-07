@@ -1,96 +1,149 @@
 #!/usr/bin/env bash
 set -e
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Verify Gravitino deployment on EKS
-# Run after deploying either broken-s3-token/ or fixed-aws-irsa/ manifests.
-# ─────────────────────────────────────────────────────────────────────────────
+# Verify the full Gravitino + HMS + OAuth deployment on EKS.
+# Run after setup-eks.sh or manual deployment.
 
 NS="gravitino-repro"
-DEPLOY="gravitino-iceberg-rest"
 
-echo "=== 1. Pod status ==="
-kubectl get pods -n "$NS" -l app="$DEPLOY"
+echo "╔══════════════════════════════════════════════════════════════════╗"
+echo "║  EKS Deployment Verification                                   ║"
+echo "╚══════════════════════════════════════════════════════════════════╝"
 echo ""
 
-POD=$(kubectl get pods -n "$NS" -l app="$DEPLOY" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+# ── 1. Pod status ────────────────────────────────────────────────────────────
+echo "━━━ 1. Pod Status ━━━"
+kubectl get pods -n "$NS" -o wide
+echo ""
+
+# ── 2. IRSA check on Gravitino pod ──────────────────────────────────────────
+echo "━━━ 2. IRSA Environment (Gravitino pod) ━━━"
+POD=$(kubectl get pods -n "$NS" -l app=gravitino-iceberg-rest -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -z "$POD" ]; then
-  echo "ERROR: No pod found. Check deployment."
-  exit 1
+  echo "  ERROR: No Gravitino pod found"
+else
+  echo "  Pod: $POD"
+  kubectl exec "$POD" -n "$NS" -- env 2>/dev/null | grep -E "AWS_WEB_IDENTITY|AWS_ROLE_ARN" \
+    || echo "  NOT FOUND — IRSA is not configured (check ServiceAccount annotation)"
 fi
-echo "Pod: $POD"
 echo ""
 
-echo "=== 2. IRSA environment check ==="
-echo "Looking for AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN..."
-kubectl exec "$POD" -n "$NS" -- env | grep -E "AWS_WEB_IDENTITY|AWS_ROLE_ARN" || echo "  NOT FOUND — IRSA is not configured on this pod"
+# ── 3. IRSA check on HMS pod ────────────────────────────────────────────────
+echo "━━━ 3. IRSA Environment (Hive Metastore pod) ━━━"
+HMS_POD=$(kubectl get pods -n "$NS" -l app=hive-metastore -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -z "$HMS_POD" ]; then
+  echo "  No Hive Metastore pod found (may be using external HMS)"
+else
+  echo "  Pod: $HMS_POD"
+  kubectl exec "$HMS_POD" -n "$NS" -- env 2>/dev/null | grep -E "AWS_WEB_IDENTITY|AWS_ROLE_ARN" \
+    || echo "  NOT FOUND — IRSA is not configured"
+fi
 echo ""
 
-echo "=== 3. Gravitino S3 env vars ==="
-echo "Checking if GRAVITINO_S3_ACCESS_KEY is set (it should NOT be for aws-irsa)..."
-kubectl exec "$POD" -n "$NS" -- env | grep -E "GRAVITINO_S3_ACCESS|GRAVITINO_S3_SECRET|GRAVITINO_CREDENTIAL" || echo "  No GRAVITINO_S3_ACCESS/SECRET keys found (good for aws-irsa)"
+# ── 4. Gravitino env vars ───────────────────────────────────────────────────
+echo "━━━ 4. Gravitino Credential Config ━━━"
+if [ -n "$POD" ]; then
+  echo "  Checking GRAVITINO_S3_ACCESS_KEY (should NOT be set for aws-irsa):"
+  HAS_KEY=$(kubectl exec "$POD" -n "$NS" -- env 2>/dev/null | grep "GRAVITINO_S3_ACCESS_KEY" || true)
+  if [ -n "$HAS_KEY" ]; then
+    echo "  WARNING: GRAVITINO_S3_ACCESS_KEY is set — this overrides IRSA!"
+    echo "  $HAS_KEY"
+  else
+    echo "  OK — no static S3 keys in environment"
+  fi
+  echo ""
+  echo "  Credential provider config:"
+  kubectl exec "$POD" -n "$NS" -- env 2>/dev/null | grep "GRAVITINO_CREDENTIAL" || echo "  (not set via env)"
+fi
 echo ""
 
-echo "=== 4. Rendered config (credential lines) ==="
-kubectl exec "$POD" -n "$NS" -- grep -E "s3-access-key|s3-secret-access|credential-providers|s3-role-arn" \
-  /root/gravitino-iceberg-rest-server/conf/gravitino-iceberg-rest-server.conf 2>/dev/null || echo "  No credential properties found"
+# ── 5. Rendered config file ─────────────────────────────────────────────────
+echo "━━━ 5. Rendered Config (credential lines) ━━━"
+if [ -n "$POD" ]; then
+  kubectl exec "$POD" -n "$NS" -- grep -E "s3-access-key|s3-secret-access|credential-providers|s3-role-arn" \
+    /root/gravitino-iceberg-rest-server/conf/gravitino-iceberg-rest-server.conf 2>/dev/null \
+    || echo "  No credential properties found in config file"
+fi
 echo ""
 
-echo "=== 5. STS caller identity (from inside pod) ==="
-kubectl exec "$POD" -n "$NS" -- aws sts get-caller-identity 2>/dev/null || echo "  aws CLI not available in container (expected — Gravitino image doesn't ship aws CLI)"
+# ── 6. OAuth server health ──────────────────────────────────────────────────
+echo "━━━ 6. OAuth Server Health ━━━"
+OAUTH_POD=$(kubectl get pods -n "$NS" -l app=oauth-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -z "$OAUTH_POD" ]; then
+  echo "  No OAuth pod found"
+else
+  echo "  Pod: $OAUTH_POD"
+  kubectl port-forward "$OAUTH_POD" 18080:8080 -n "$NS" &
+  OAUTH_PF=$!
+  sleep 2
+  HEALTH=$(curl -s http://localhost:18080/health 2>/dev/null || echo "unreachable")
+  echo "  /health: $HEALTH"
+  kill $OAUTH_PF 2>/dev/null
+fi
 echo ""
 
-echo "=== 6. Test Gravitino REST API ==="
-# Port-forward temporarily
-kubectl port-forward "$POD" 19001:9001 -n "$NS" &
-PF_PID=$!
-sleep 3
+# ── 7. Gravitino REST API test ───────────────────────────────────────────────
+echo "━━━ 7. Gravitino REST API Test ━━━"
+if [ -n "$POD" ]; then
+  kubectl port-forward "$POD" 19001:9001 -n "$NS" &
+  GRAV_PF=$!
+  sleep 3
 
-echo "Listing namespaces..."
-curl -s http://localhost:19001/iceberg/v1/namespaces 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "  Failed to reach Gravitino"
-echo ""
+  echo "  Listing namespaces..."
+  curl -s http://localhost:19001/iceberg/v1/namespaces 2>/dev/null \
+    | python3 -m json.tool 2>/dev/null || echo "  Failed to reach Gravitino"
+  echo ""
 
-echo "Testing credential vending (X-Iceberg-Access-Delegation)..."
-# Create a test namespace + table first
-curl -sf -X POST http://localhost:19001/iceberg/v1/namespaces \
-  -H "Content-Type: application/json" \
-  -d '{"namespace": ["irsa_test"], "properties": {}}' >/dev/null 2>&1 || true
+  echo "  Testing credential vending..."
+  # Try loading a table with credential vending header
+  curl -sf -X POST http://localhost:19001/iceberg/v1/namespaces \
+    -H "Content-Type: application/json" \
+    -d '{"namespace": ["verify_test"], "properties": {}}' >/dev/null 2>&1 || true
 
-curl -sf -X POST http://localhost:19001/iceberg/v1/namespaces/irsa_test/tables \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "verify_table",
-    "schema": {"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","type":"long","required":true}]}
-  }' >/dev/null 2>&1 || true
+  curl -sf -X POST http://localhost:19001/iceberg/v1/namespaces/verify_test/tables \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "check_creds",
+      "schema": {"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","type":"long","required":true}]}
+    }' >/dev/null 2>&1 || true
 
-RESP=$(curl -s -w "\n%{http_code}" \
-  -H "X-Iceberg-Access-Delegation: vended-credentials" \
-  http://localhost:19001/iceberg/v1/namespaces/irsa_test/tables/verify_table 2>/dev/null)
-CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
+  RESP=$(curl -s -w "\n%{http_code}" \
+    -H "X-Iceberg-Access-Delegation: vended-credentials" \
+    http://localhost:19001/iceberg/v1/namespaces/verify_test/tables/check_creds 2>/dev/null)
+  CODE=$(echo "$RESP" | tail -1)
+  BODY=$(echo "$RESP" | sed '$d')
 
-if [ "$CODE" = "200" ]; then
-  echo "  ✅ SUCCESS (HTTP $CODE) — credential vending works!"
-  echo "$BODY" | python3 -c "
+  if [ "$CODE" = "200" ]; then
+    echo "  SUCCESS (HTTP $CODE) — credential vending works!"
+    echo "$BODY" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 cfg = d.get('config', {})
-if cfg:
-    print('  Vended config keys:', list(cfg.keys()))
+if 's3.access-key-id' in cfg:
+    print('  Vended S3 key starts with:', cfg['s3.access-key-id'][:8] + '...')
+    print('  Vended S3 session token:', 'present' if cfg.get('s3.session-token') else 'missing')
 else:
-    print('  (no vended config returned)')
-" 2>/dev/null
-else
-  echo "  ❌ FAILED (HTTP $CODE)"
-  echo "$BODY" | python3 -c "
+    print('  Config keys:', list(cfg.keys()) if cfg else '(none)')
+" 2>/dev/null || true
+  else
+    echo "  FAILED (HTTP $CODE)"
+    echo "$BODY" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
     print('  Error:', d.get('error',{}).get('message','unknown')[:200])
 except: print('  Non-JSON response')
-" 2>/dev/null
-fi
+" 2>/dev/null || true
+  fi
 
-kill $PF_PID 2>/dev/null
+  kill $GRAV_PF 2>/dev/null
+fi
 echo ""
-echo "=== Done ==="
+
+# ── 8. NLB status ───────────────────────────────────────────────────────────
+echo "━━━ 8. NLB External Endpoints ━━━"
+kubectl get svc gravitino-public oauth-public -n "$NS" 2>/dev/null \
+  || echo "  NLB services not found — run setup-eks.sh first"
+echo ""
+
+echo "━━━ Done ━━━"

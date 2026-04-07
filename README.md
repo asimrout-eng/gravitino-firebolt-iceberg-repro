@@ -208,7 +208,24 @@ SUCCESS (HTTP 200) — credential vending works!
 
 ## Test 3: Firebolt Cloud + EKS (Full End-to-End)
 
-The production-equivalent proof: **Firebolt Cloud → Gravitino (EKS, IRSA) → S3**.
+The production-equivalent proof: **Firebolt Cloud → OAuth → Gravitino (aws-irsa) → Hive Metastore → S3**.
+
+### What Gets Deployed
+
+| Component | Image | Purpose |
+|---|---|---|
+| **Gravitino Iceberg REST** | `apache/gravitino-iceberg-rest:1.2.0` | Iceberg catalog with `aws-irsa` credential vending |
+| **Hive Metastore** | `apache/hive:4.0.0` | Iceberg metadata storage (Derby backend) |
+| **OAuth Server** | `python:3.11-slim` | JWT token server for Firebolt authentication |
+| **2x Public NLBs** | — | Expose Gravitino (9001) and OAuth (8080) to Firebolt Cloud |
+
+All pods use the same IRSA-annotated ServiceAccount for S3 access.
+
+### Firebolt Cloud Credentials
+
+You need an active **Firebolt Cloud account** with a running engine.
+There is no automated way to provision Firebolt credentials — you must log into
+the Firebolt UI and run the SQL from the output of `setup-eks.sh`.
 
 ### One-Command Setup
 
@@ -222,25 +239,33 @@ This script:
 2. Sets up OIDC provider for IRSA
 3. Creates IAM role with S3 access + IRSA trust policy
 4. Creates Kubernetes ServiceAccount with IRSA annotation
-5. Deploys Gravitino with `aws-irsa` credential provider
-6. Deploys OAuth server for JWT authentication
-7. Creates a public NLB for Firebolt Cloud connectivity
-8. Prints the exact SQL to run in Firebolt
+5. Deploys **Hive Metastore** with S3A + IRSA
+6. Deploys **Gravitino** with `aws-irsa` credential provider
+7. Deploys **OAuth server** (pure Python, no external deps)
+8. Creates **two public NLBs** (one for Gravitino, one for OAuth)
+9. Creates a **test Iceberg table** via Gravitino REST API
+10. Prints the exact **Firebolt SQL** to run
 
 ### Manual Steps
 
 ```bash
 kubectl apply -f k8s/00-namespace.yaml
 kubectl apply -f k8s/01-serviceaccount.yaml
-kubectl apply -f k8s/fixed-aws-irsa/
-kubectl apply -f k8s/02-oauth-server.yaml
-kubectl apply -f k8s/03-public-nlb.yaml
+kubectl apply -f k8s/04-hive-metastore.yaml   # HMS (edit S3 bucket first)
+kubectl apply -f k8s/fixed-aws-irsa/           # Gravitino (edit ConfigMap first)
+kubectl apply -f k8s/02-oauth-server.yaml      # OAuth token server
+kubectl apply -f k8s/03-public-nlb.yaml        # Two public NLBs
 
-# Get the NLB DNS name
-kubectl get svc gravitino-public -n gravitino-repro
+# Get the NLB DNS names (takes 2-3 min to provision)
+kubectl get svc gravitino-public oauth-public -n gravitino-repro
+
+# Create test Iceberg table
+bash k8s/create-test-data.sh
 ```
 
 ### Firebolt Cloud SQL
+
+Gravitino and OAuth are on **separate NLBs** (different DNS names):
 
 ```sql
 CREATE LOCATION gravitino_eks_test
@@ -248,17 +273,18 @@ WITH
   SOURCE = ICEBERG
   CATALOG = REST
   CATALOG_OPTIONS = (
-    URL = 'http://<NLB_DNS>:9001/iceberg/'
+    URL = 'http://<GRAVITINO_NLB>:9001/iceberg/'
     WAREHOUSE = 'hive'
-    OAUTH_SERVER_URI = 'http://<NLB_DNS>:8080'
+    OAUTH_SERVER_URI = 'http://<OAUTH_NLB>:8080'
     OAUTH_TOKEN_PATH = '/oauth/tokens'
     CREDENTIAL = 'firebolt:repro-secret-change-me'
   );
 
+-- 0 rows returned = success (table exists but is empty)
 SELECT * FROM READ_ICEBERG(
   LOCATION => 'gravitino_eks_test',
-  NAMESPACE => '<namespace>',
-  TABLE => '<table>'
+  NAMESPACE => 'repro_test',
+  TABLE => 'sample_table'
 ) LIMIT 10;
 ```
 
@@ -269,6 +295,8 @@ SELECT * FROM READ_ICEBERG(
 - Gravitino vends temporary S3 credentials to Firebolt via `aws-irsa` provider
 - Firebolt reads Parquet files directly from S3 using vended credentials
 - **Zero static AWS keys in the entire flow**
+
+A successful 0-row result on the `READ_ICEBERG` query proves every leg of the chain works.
 
 ### Cleanup
 
@@ -365,28 +393,30 @@ kubectl exec <POD> -n <NAMESPACE> -- env | grep AWS_ROLE_ARN
 ```
 gravitino-firebolt-iceberg-repro/
 │
-├── README.md                   # This file
-├── docker-compose.yml          # Local: MinIO + Hive Metastore
-├── repro-test.sh               # Local: Automated 5-scenario Docker test
+├── README.md                    # This file
+├── docker-compose.yml           # Local: MinIO + Hive Metastore
+├── repro-test.sh                # Local: Automated 5-scenario Docker test
 ├── conf/
-│   └── hive-site.xml           # Hive Metastore → MinIO S3A config
+│   └── hive-site.xml            # Hive Metastore → MinIO S3A config
 │
-└── k8s/                        # EKS deployment manifests
-    ├── 00-namespace.yaml       # Namespace
-    ├── 01-serviceaccount.yaml  # IRSA-annotated ServiceAccount
-    ├── 02-oauth-server.yaml    # OAuth token server (JWT)
-    ├── 03-public-nlb.yaml      # Public NLB for Firebolt Cloud
-    ├── setup-eks.sh            # One-command full EKS setup
-    ├── verify-eks.sh           # Verification script
+└── k8s/                         # EKS deployment manifests
+    ├── 00-namespace.yaml        # Namespace
+    ├── 01-serviceaccount.yaml   # IRSA-annotated ServiceAccount
+    ├── 02-oauth-server.yaml     # OAuth token server (pure Python, JWT)
+    ├── 03-public-nlb.yaml       # Two public NLBs (Gravitino + OAuth)
+    ├── 04-hive-metastore.yaml   # Hive Metastore with S3A + IRSA
+    ├── setup-eks.sh             # One-command full EKS + Firebolt setup
+    ├── verify-eks.sh            # Comprehensive verification script
+    ├── create-test-data.sh      # Creates namespace + table via REST API
     │
-    ├── broken-s3-token/        # Reproduces the customer error
-    │   ├── configmap.yaml      #   GRAVITINO_CREDENTIAL_PROVIDERS=s3-token
-    │   ├── secret.yaml         #   Static AWS key placeholders
-    │   └── deployment.yaml     #   Injects GRAVITINO_S3_ACCESS_KEY
+    ├── broken-s3-token/         # Reproduces the customer error
+    │   ├── configmap.yaml       #   GRAVITINO_CREDENTIAL_PROVIDERS=s3-token
+    │   ├── secret.yaml          #   Static AWS key placeholders
+    │   └── deployment.yaml      #   Injects GRAVITINO_S3_ACCESS_KEY
     │
-    └── fixed-aws-irsa/         # The fix
-        ├── configmap.yaml      #   GRAVITINO_CREDENTIAL_PROVIDERS=aws-irsa
-        └── deployment.yaml     #   No static keys, uses IRSA
+    └── fixed-aws-irsa/          # The fix
+        ├── configmap.yaml       #   GRAVITINO_CREDENTIAL_PROVIDERS=aws-irsa
+        └── deployment.yaml      #   No static keys, uses IRSA
 ```
 
 ## Verified Against

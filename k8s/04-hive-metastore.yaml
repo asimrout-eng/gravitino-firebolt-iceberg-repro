@@ -1,0 +1,109 @@
+# Hive Metastore for EKS — stores Iceberg table metadata.
+# Uses Derby (embedded) for the metastore DB — fine for testing.
+# Reads S3 via IRSA (same ServiceAccount as Gravitino).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hive-site-config
+  namespace: gravitino-repro
+data:
+  hive-site.xml: |
+    <?xml version="1.0"?>
+    <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+    <configuration>
+      <property>
+        <name>fs.s3a.impl</name>
+        <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+      </property>
+      <property>
+        <name>fs.s3.impl</name>
+        <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+      </property>
+      <!-- IRSA: the AWS SDK default chain picks up AWS_WEB_IDENTITY_TOKEN_FILE -->
+      <property>
+        <name>fs.s3a.aws.credentials.provider</name>
+        <value>com.amazonaws.auth.DefaultAWSCredentialsProviderChain</value>
+      </property>
+      <!-- Placeholder — setup-eks.sh replaces __S3_BUCKET__ and __S3_PREFIX__ -->
+      <property>
+        <name>metastore.warehouse.dir</name>
+        <value>s3a://__S3_BUCKET__/__S3_PREFIX__/</value>
+      </property>
+      <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>s3a://__S3_BUCKET__/__S3_PREFIX__/</value>
+      </property>
+    </configuration>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hive-metastore
+  namespace: gravitino-repro
+  labels:
+    app: hive-metastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hive-metastore
+  template:
+    metadata:
+      labels:
+        app: hive-metastore
+    spec:
+      serviceAccountName: gravitino-sa
+      containers:
+        - name: hive-metastore
+          image: apache/hive:4.0.0
+          ports:
+            - containerPort: 9083
+          env:
+            - name: SERVICE_NAME
+              value: "metastore"
+            - name: HIVE_AUX_JARS_PATH
+              value: "/opt/hadoop/share/hadoop/tools/lib/hadoop-aws-3.3.6.jar,/opt/hadoop/share/hadoop/tools/lib/aws-java-sdk-bundle-1.12.367.jar"
+            - name: HADOOP_CLASSPATH
+              value: "/opt/hadoop/share/hadoop/tools/lib/hadoop-aws-3.3.6.jar:/opt/hadoop/share/hadoop/tools/lib/aws-java-sdk-bundle-1.12.367.jar"
+          volumeMounts:
+            - name: hive-config
+              mountPath: /opt/hive/conf/hive-site.xml
+              subPath: hive-site.xml
+            - name: hive-data
+              mountPath: /opt/hive/data
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          readinessProbe:
+            tcpSocket:
+              port: 9083
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9083
+            initialDelaySeconds: 60
+            periodSeconds: 15
+      volumes:
+        - name: hive-config
+          configMap:
+            name: hive-site-config
+        - name: hive-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive-metastore
+  namespace: gravitino-repro
+spec:
+  selector:
+    app: hive-metastore
+  ports:
+    - port: 9083
+      targetPort: 9083
+  type: ClusterIP
