@@ -8,7 +8,7 @@ set -e
 #   bash k8s/create-test-data.sh [GRAVITINO_URL]
 #
 # GRAVITINO_URL defaults to the port-forwarded local address.
-# For NLB access, pass the NLB DNS: bash k8s/create-test-data.sh http://<NLB>:9001
+# For ALB access, pass the ALB DNS: bash k8s/create-test-data.sh http://<ALB_DNS>
 
 NS="gravitino-repro"
 DEPLOY="gravitino-iceberg-rest"

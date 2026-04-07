@@ -142,9 +142,9 @@ fi
 echo ""
 
 # ── 8. NLB status ───────────────────────────────────────────────────────────
-echo "━━━ 8. NLB External Endpoints ━━━"
-kubectl get svc gravitino-public oauth-public -n "$NS" 2>/dev/null \
-  || echo "  NLB services not found — run setup-eks.sh first"
+echo "━━━ 8. ALB Ingress ━━━"
+kubectl get ingress gravitino-public -n "$NS" 2>/dev/null \
+  || echo "  ALB Ingress not found — run setup-eks.sh first"
 echo ""
 
 echo "━━━ Done ━━━"

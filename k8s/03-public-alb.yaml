@@ -1,0 +1,42 @@
+# Single ALB with path-based routing — replaces two NLBs.
+# Routes /iceberg/* to Gravitino and /oauth/* to the OAuth server.
+#
+# Requires: AWS Load Balancer Controller (setup-eks.sh installs it).
+# For testing only — delete when done.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gravitino-public
+  namespace: gravitino-repro
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /iceberg/v1/namespaces
+    alb.ingress.kubernetes.io/group.name: gravitino-repro
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /iceberg
+            pathType: Prefix
+            backend:
+              service:
+                name: gravitino-iceberg-rest
+                port:
+                  number: 9001
+          - path: /oauth
+            pathType: Prefix
+            backend:
+              service:
+                name: oauth-server
+                port:
+                  number: 8080
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: oauth-server
+                port:
+                  number: 8080
