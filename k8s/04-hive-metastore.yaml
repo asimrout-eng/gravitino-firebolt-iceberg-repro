@@ -1,6 +1,13 @@
 # Hive Metastore for EKS — stores Iceberg table metadata.
 # Uses Derby (embedded) for the metastore DB — fine for testing.
 # Reads S3 via IRSA (same ServiceAccount as Gravitino).
+#
+# ⚠️  WARNING: hive-site.xml contains __S3_BUCKET__ and __S3_PREFIX__ placeholders.
+#    If using setup-eks.sh, they are replaced automatically via sed.
+#    If applying manually, replace them BEFORE applying:
+#
+#      sed 's|__S3_BUCKET__|your-bucket|g; s|__S3_PREFIX__|your/prefix|g' \
+#        k8s/04-hive-metastore.yaml | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:

@@ -5,6 +5,9 @@ set -e
 # Run after setup-eks.sh or manual deployment.
 
 NS="gravitino-repro"
+PF_PIDS=""
+cleanup() { for p in $PF_PIDS; do kill "$p" 2>/dev/null; done; }
+trap cleanup EXIT
 
 echo "╔══════════════════════════════════════════════════════════════════╗"
 echo "║  EKS Deployment Verification                                   ║"
@@ -74,11 +77,10 @@ if [ -z "$OAUTH_POD" ]; then
 else
   echo "  Pod: $OAUTH_POD"
   kubectl port-forward "$OAUTH_POD" 18080:8080 -n "$NS" &
-  OAUTH_PF=$!
+  PF_PIDS="$PF_PIDS $!"
   sleep 2
   HEALTH=$(curl -s http://localhost:18080/health 2>/dev/null || echo "unreachable")
   echo "  /health: $HEALTH"
-  kill $OAUTH_PF 2>/dev/null
 fi
 echo ""
 
@@ -86,7 +88,7 @@ echo ""
 echo "━━━ 7. Gravitino REST API Test ━━━"
 if [ -n "$POD" ]; then
   kubectl port-forward "$POD" 19001:9001 -n "$NS" &
-  GRAV_PF=$!
+  PF_PIDS="$PF_PIDS $!"
   sleep 3
 
   echo "  Listing namespaces..."
@@ -136,7 +138,6 @@ except: print('  Non-JSON response')
 " 2>/dev/null || true
   fi
 
-  kill $GRAV_PF 2>/dev/null
 fi
 echo ""
 

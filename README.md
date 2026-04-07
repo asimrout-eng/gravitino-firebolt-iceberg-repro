@@ -176,11 +176,14 @@ with real IRSA credentials.
 
 ```bash
 # Edit placeholders in the manifests:
-#   01-serviceaccount.yaml → your IAM role ARN
-#   configmap.yaml → your bucket, region, Hive Metastore URI
+#   01-serviceaccount.yaml     → your IAM role ARN
+#   04-hive-metastore.yaml     → your S3 bucket (replace __S3_BUCKET__ / __S3_PREFIX__)
+#   configmap.yaml (in each)   → your bucket, region, role ARN
 
 kubectl apply -f k8s/00-namespace.yaml
 kubectl apply -f k8s/01-serviceaccount.yaml
+kubectl apply -f k8s/04-hive-metastore.yaml   # Hive Metastore (edit S3 bucket first!)
+kubectl apply -f k8s/02-oauth-server.yaml      # OAuth token server
 
 # To REPRODUCE the error:
 kubectl apply -f k8s/broken-s3-token/
@@ -297,6 +300,15 @@ SELECT * FROM READ_ICEBERG(
 - **Zero static AWS keys in the entire flow**
 
 A successful 0-row result on the `READ_ICEBERG` query proves every leg of the chain works.
+
+### Security Note
+
+This is a **test/reproduction** setup. For production:
+- **OAuth**: Gravitino is not configured with `GRAVITINO_AUTHENTICATORS` — it accepts
+  unauthenticated requests. The OAuth server exists to satisfy Firebolt's client-side
+  requirement. For production, configure Gravitino's authenticator with the shared signing key.
+- **NLBs**: The NLBs are `internet-facing` with no security groups restricting access.
+  For production, use `internal` NLBs behind PrivateLink or VPN.
 
 ### Cleanup
 

@@ -222,9 +222,7 @@ echo ""
 # ── Step 8: Create test data ────────────────────────────────────────────────
 echo "━━━ Step 8/8: Test Data ━━━"
 if [ -n "$GRAV_DNS" ]; then
-  bash "$SCRIPT_DIR/create-test-data.sh" "http://${GRAV_DNS}:9001" 2>/dev/null || \
-    echo "  (Will retry via port-forward if NLB isn't ready yet)"
-  if [ $? -ne 0 ]; then
+  if ! bash "$SCRIPT_DIR/create-test-data.sh" "http://${GRAV_DNS}:9001" 2>/dev/null; then
     echo "  NLB not reachable yet, trying via port-forward..."
     bash "$SCRIPT_DIR/create-test-data.sh"
   fi
