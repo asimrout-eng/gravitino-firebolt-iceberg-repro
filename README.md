@@ -220,7 +220,7 @@ The production-equivalent proof: **Firebolt Cloud → OAuth → Gravitino (aws-i
 | **Gravitino Iceberg REST** | `apache/gravitino-iceberg-rest:1.2.0` | Iceberg catalog with `aws-irsa` credential vending |
 | **Hive Metastore** | `apache/hive:4.0.0` | Iceberg metadata storage (Derby backend) |
 | **OAuth Server** | `python:3.11-slim` | JWT token server for Firebolt authentication |
-| **ALB Ingress** | — | Single internet-facing ALB with path-based routing to Gravitino + OAuth |
+| **ALB or NLB** | — | Internet-facing load balancer(s) to expose Gravitino + OAuth to Firebolt Cloud |
 
 All pods use the same IRSA-annotated ServiceAccount for S3 access.
 
@@ -270,10 +270,13 @@ kubectl apply -f k8s/01-serviceaccount.yaml
 kubectl apply -f k8s/04-hive-metastore.yaml   # HMS (edit S3 bucket first!)
 kubectl apply -f k8s/fixed-aws-irsa/           # Gravitino (edit ConfigMap first)
 kubectl apply -f k8s/02-oauth-server.yaml      # OAuth token server
-kubectl apply -f k8s/03-public-alb.yaml        # ALB Ingress (path-based routing)
-
-# Get the ALB DNS name (takes 2-3 min to provision)
+# Option A: Single ALB (requires AWS Load Balancer Controller + helm)
+kubectl apply -f k8s/03-public-alb.yaml
 kubectl get ingress gravitino-public -n gravitino-repro
+
+# Option B: Two NLBs (no extra dependencies, mirrors customer setup)
+kubectl apply -f k8s/03-public-nlb.yaml
+kubectl get svc gravitino-public oauth-public -n gravitino-repro
 
 # Create test Iceberg table
 bash k8s/create-test-data.sh
@@ -281,7 +284,7 @@ bash k8s/create-test-data.sh
 
 ### Firebolt Cloud SQL
 
-Single ALB hostname — Gravitino and OAuth share the same entry point via path routing:
+**Option A — ALB** (single hostname, path-based routing):
 
 ```sql
 CREATE LOCATION gravitino_eks_test
@@ -295,7 +298,27 @@ WITH
     OAUTH_TOKEN_PATH = '/oauth/tokens'
     CREDENTIAL = 'firebolt:repro-secret-change-me'
   );
+```
 
+**Option B — NLBs** (two hostnames, mirrors customer setup):
+
+```sql
+CREATE LOCATION gravitino_eks_test
+WITH
+  SOURCE = ICEBERG
+  CATALOG = REST
+  CATALOG_OPTIONS = (
+    URL = 'http://<GRAVITINO_NLB>:9001/iceberg/'
+    WAREHOUSE = 'hive'
+    OAUTH_SERVER_URI = 'http://<OAUTH_NLB>:8080'
+    OAUTH_TOKEN_PATH = '/oauth/tokens'
+    CREDENTIAL = 'firebolt:repro-secret-change-me'
+  );
+```
+
+Then query:
+
+```sql
 -- 0 rows returned = success (table exists but is empty)
 SELECT * FROM READ_ICEBERG(
   LOCATION => 'gravitino_eks_test',
@@ -320,8 +343,8 @@ This is a **test/reproduction** setup. For production:
 - **OAuth**: Gravitino is not configured with `GRAVITINO_AUTHENTICATORS` — it accepts
   unauthenticated requests. The OAuth server exists to satisfy Firebolt's client-side
   requirement. For production, configure Gravitino's authenticator with the shared signing key.
-- **ALB**: The ALB is `internet-facing` with no WAF or security groups restricting access.
-  For production, use an `internal` ALB behind PrivateLink or VPN.
+- **Load Balancer**: The ALB/NLBs are `internet-facing` with no WAF or security groups.
+  For production, use `internal` load balancers behind PrivateLink or VPN.
 
 ### Cleanup
 
@@ -428,7 +451,8 @@ gravitino-firebolt-iceberg-repro/
     ├── 00-namespace.yaml        # Namespace
     ├── 01-serviceaccount.yaml   # IRSA-annotated ServiceAccount
     ├── 02-oauth-server.yaml     # OAuth token server (pure Python, JWT)
-    ├── 03-public-alb.yaml       # ALB Ingress (path-based routing)
+    ├── 03-public-alb.yaml       # Option A: Single ALB with path-based routing
+    ├── 03-public-nlb.yaml       # Option B: Two NLBs (mirrors customer setup)
     ├── 04-hive-metastore.yaml   # Hive Metastore with S3A + IRSA
     ├── setup-eks.sh             # One-command full EKS + Firebolt setup
     ├── verify-eks.sh            # Comprehensive verification script

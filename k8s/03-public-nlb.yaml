@@ -1,0 +1,49 @@
+# Alternative: Two NLBs instead of the ALB Ingress.
+# Use this if the AWS Load Balancer Controller is not installed,
+# or to mirror the customer's NLB/NodePort setup exactly.
+#
+# Usage:
+#   kubectl apply -f k8s/03-public-nlb.yaml
+#   # Instead of: kubectl apply -f k8s/03-public-alb.yaml
+#
+# Firebolt SQL will need TWO different hostnames:
+#   URL = 'http://<GRAVITINO_NLB>:9001/iceberg/'
+#   OAUTH_SERVER_URI = 'http://<OAUTH_NLB>:8080'
+
+# NLB 1: Gravitino Iceberg REST (port 9001)
+apiVersion: v1
+kind: Service
+metadata:
+  name: gravitino-public
+  namespace: gravitino-repro
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: gravitino-iceberg-rest
+  ports:
+    - name: gravitino
+      port: 9001
+      targetPort: 9001
+---
+# NLB 2: OAuth Token Server (port 8080)
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth-public
+  namespace: gravitino-repro
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: oauth-server
+  ports:
+    - name: oauth
+      port: 8080
+      targetPort: 8080
