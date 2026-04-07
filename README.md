@@ -274,9 +274,9 @@ kubectl apply -f k8s/02-oauth-server.yaml      # OAuth token server
 kubectl apply -f k8s/03-public-alb.yaml
 kubectl get ingress gravitino-public -n gravitino-repro
 
-# Option B: Two NLBs (no extra dependencies, mirrors customer setup)
+# Option B: Two NLBs (no AWS LB Controller needed, mirrors customer setup)
 kubectl apply -f k8s/03-public-nlb.yaml
-kubectl get svc gravitino-public oauth-public -n gravitino-repro
+kubectl get svc gravitino-nlb oauth-nlb -n gravitino-repro
 
 # Create test Iceberg table
 bash k8s/create-test-data.sh

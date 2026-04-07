@@ -6,20 +6,25 @@
 #   kubectl apply -f k8s/03-public-nlb.yaml
 #   # Instead of: kubectl apply -f k8s/03-public-alb.yaml
 #
+# Uses in-tree cloud provider (service.beta.kubernetes.io/aws-load-balancer-type: "nlb")
+# so NO AWS Load Balancer Controller is required.
+#
 # Firebolt SQL will need TWO different hostnames:
 #   URL = 'http://<GRAVITINO_NLB>:9001/iceberg/'
 #   OAUTH_SERVER_URI = 'http://<OAUTH_NLB>:8080'
+#
+# Get DNS names:
+#   kubectl get svc gravitino-nlb oauth-nlb -n gravitino-repro
 
 # NLB 1: Gravitino Iceberg REST (port 9001)
+# Uses in-tree cloud provider annotation — no AWS Load Balancer Controller needed.
 apiVersion: v1
 kind: Service
 metadata:
-  name: gravitino-public
+  name: gravitino-nlb
   namespace: gravitino-repro
   annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: "external"
-    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
-    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
 spec:
   type: LoadBalancer
   selector:
@@ -33,12 +38,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: oauth-public
+  name: oauth-nlb
   namespace: gravitino-repro
   annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: "external"
-    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
-    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
 spec:
   type: LoadBalancer
   selector:

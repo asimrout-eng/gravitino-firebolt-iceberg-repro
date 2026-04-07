@@ -141,10 +141,19 @@ except: print('  Non-JSON response')
 fi
 echo ""
 
-# ── 8. NLB status ───────────────────────────────────────────────────────────
-echo "━━━ 8. ALB Ingress ━━━"
-kubectl get ingress gravitino-public -n "$NS" 2>/dev/null \
-  || echo "  ALB Ingress not found — run setup-eks.sh first"
+# ── 8. Load balancer status ───────────────────────────────────────────────────
+echo "━━━ 8. Load Balancer (ALB or NLB) ━━━"
+ALB_FOUND=$(kubectl get ingress gravitino-public -n "$NS" 2>/dev/null)
+NLB_FOUND=$(kubectl get svc gravitino-nlb -n "$NS" 2>/dev/null)
+if [ -n "$ALB_FOUND" ]; then
+  echo "  ALB Ingress:"
+  kubectl get ingress gravitino-public -n "$NS"
+elif [ -n "$NLB_FOUND" ]; then
+  echo "  NLB Services:"
+  kubectl get svc gravitino-nlb oauth-nlb -n "$NS"
+else
+  echo "  No ALB Ingress or NLB Services found — run setup-eks.sh or apply 03-public-*.yaml"
+fi
 echo ""
 
 echo "━━━ Done ━━━"
